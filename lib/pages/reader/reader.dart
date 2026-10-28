@@ -30,6 +30,8 @@ import 'package:venera/foundation/image_provider/cached_image.dart';
 import 'package:venera/foundation/image_provider/reader_image.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/log.dart';
+import 'package:venera/foundation/nas_client.dart';
+import 'package:venera/foundation/nas_offline_mode.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/network/images.dart';
 import 'package:venera/pages/settings/settings_page.dart';
@@ -38,6 +40,7 @@ import 'package:venera/utils/data_sync.dart';
 import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/file_type.dart';
 import 'package:venera/utils/io.dart';
+import 'package:venera/utils/nas_sync.dart';
 import 'package:venera/utils/tags_translation.dart';
 import 'package:venera/utils/translations.dart';
 import 'package:venera/utils/volume.dart';
@@ -113,6 +116,81 @@ class _ReaderState extends State<Reader>
   @override
   void update() {
     setState(() {});
+  }
+
+  /// 停留多久之后才播放动图。
+  ///
+  /// 取值权衡：
+  ///   - 太短（<300ms）快速连翻时每页都触发解码，卡顿回来；
+  ///   - 太长（>2s）用户会觉得"GIF 坏了"。
+  /// 600ms 大约是"翻页动作完成、目光落到画面上"的时间，
+  /// 快速连翻时每页都来不及触发，正好达到目的。
+  static const _animateDelay = Duration(milliseconds: 600);
+
+  Timer? _animateTimer;
+
+  /// 页码变化时被 setPage 调用：先把动画关掉，再排一个延迟开启。
+  ///
+  /// 这是"翻页跟手 + 动图仍能播"的平衡点：
+  ///   - 立刻把 animatePage 置空 → 新页只解首帧，画面最快出来；
+  ///   - 600ms 后若仍停在同一页 → 允许该页播动画。
+  @override
+  void onPageSettling(int page) {
+    _animateTimer?.cancel();
+    _animateTimer = null;
+
+    if (animatePage != null) {
+      animatePage = null;
+      update();
+    }
+
+    _animateTimer = Timer(_animateDelay, () {
+      if (!mounted) return;
+      // 停留够了且还停在同一页 → 允许播动画
+      if (this.page != page) return;
+      _switchToAnimated(page);
+    });
+  }
+
+  /// 切换到"可播放动画"的 provider，且**不产生黑屏**。
+  ///
+  /// 关键点：allowAnimation 是 provider key 的一部分（必须如此，
+  /// 否则 imageCache 会复用静态条目，动画永远不播）。但 key 一变，
+  /// 就意味着要重新解码一张 10MB 的图；PhotoView 又没有
+  /// gaplessPlayback，解码期间画面就是黑的——这就是用户看到的
+  /// "切入画面后闪一下黑屏"。
+  ///
+  /// 解法：先把带 allowAnimation=true 的 provider **预热进 imageCache**，
+  /// 等它解码完再切 animatePage。这样切过去的瞬间缓存里已有图，
+  /// 直接命中，不会闪。
+  Future<void> _switchToAnimated(int page) async {
+    if (animatePage == page) return;
+
+    final images = this.images;
+    if (images != null && page >= 1 && page <= images.length) {
+      final imageKey = images[page - 1];
+      final provider = ReaderImageProvider(
+        imageKey,
+        type.comicSource?.key,
+        cid,
+        eid,
+        page,
+        enableResize: mode.isContinuous,
+        allowAnimation: true,
+      );
+      try {
+        await precacheImage(provider, context);
+      } catch (_) {
+        // 预热失败不影响功能：退化成切过去时闪一下，
+        // 总比因为一张图坏了就永远不播动画好。
+      }
+      if (!mounted) return;
+      // 预热期间用户可能又翻页了
+      if (this.page != page) return;
+    }
+
+    animatePage = page;
+    update();
   }
 
   /// The maximum page number for images only (excluding chapter comments page).
@@ -227,6 +305,12 @@ class _ReaderState extends State<Reader>
       handleVolumeEvent();
     }
     setImageCacheSize();
+    // 首次进入也排一次"停稳检测"：直接停在某一页时同样应该播动图。
+    // 此时 page 已经确定，放到下一帧再调，避免在 initState 里 setState。
+    final initialPage = page;
+    Future.microtask(() {
+      if (mounted) onPageSettling(initialPage);
+    });
     Future.delayed(const Duration(milliseconds: 200), () {
       LocalFavoritesManager().onRead(cid, type);
     });
@@ -273,6 +357,10 @@ class _ReaderState extends State<Reader>
     if (isFullscreen) {
       fullscreen();
     }
+    // 动画延迟定时器必须取消，否则退出阅读器后它还会
+    // 往已 dispose 的 State 上 setState
+    _animateTimer?.cancel();
+    _animateTimer = null;
     autoPageTurningTimer?.cancel();
     focusNode.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -288,22 +376,39 @@ class _ReaderState extends State<Reader>
   @override
   Widget build(BuildContext context) {
     _checkImagesPerPageChange();
-    return KeyboardListener(
-      focusNode: focusNode,
-      autofocus: true,
-      onKeyEvent: onKeyEvent,
-      child: Overlay(
-        initialEntries: [
-          OverlayEntry(
-            builder: (context) {
-              return _ReaderScaffold(
-                child: _ReaderGestureDetector(
-                  child: _ReaderImages(key: Key(chapter.toString())),
-                ),
-              );
-            },
-          ),
-        ],
+    // 返回键由阅读器自己接管，只弹自己这一层。
+    //
+    // 之前这里是裸的，返回完全交给框架处理。阅读器压在根 Navigator 上、
+    // 详情页压在内层 Navigator 上，两层各自都"可以 pop"；Android 13+
+    // 的预测式返回会把同一次返回同时触发给根路由和下层 PopScope 的转发，
+    // 于是阅读器弹掉之后，详情页跟着又被弹了一次——用户看到的就是
+    // "从阅读器返回，没回到详情页，直接往上退了一级"。
+    //
+    // canPop: false 把这次 pop 变成"框架不自己动手，由我们显式做一次"，
+    // 保证一次返回只弹一层。
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        Navigator.of(context).pop();
+      },
+      child: KeyboardListener(
+        focusNode: focusNode,
+        autofocus: true,
+        onKeyEvent: onKeyEvent,
+        child: Overlay(
+          initialEntries: [
+            OverlayEntry(
+              builder: (context) {
+                return _ReaderScaffold(
+                  child: _ReaderGestureDetector(
+                    child: _ReaderImages(key: Key(chapter.toString())),
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -364,6 +469,9 @@ class _ReaderState extends State<Reader>
       _updateHistoryTimer?.cancel();
       _updateHistoryTimer = Timer(const Duration(seconds: 1), () {
         HistoryManager().addHistoryAsync(history!);
+        // 阅读进度同步到 NAS：复用同一个 1s 防抖窗口，
+        // 因此快速翻页只会产生最后一次进度，不会淹没同步队列。
+        NasSync().onHistoryUpdated(history!);
         _updateHistoryTimer = null;
       });
     }
@@ -632,8 +740,22 @@ abstract mixin class _ReaderLocation {
     if (_animationCount > 0 && _pendingPage != null && page != _pendingPage) {
       return;
     }
-    this.page = page;
+    if (this.page != page) {
+      // 先落 page 再通知：onPageSettling 的定时器里用
+      // `this.page != page` 判断"是否还停在同一页"，
+      // 顺序反了会导致条件恒成立、动画永远不被允许。
+      this.page = page;
+      // 换页即视为"还没停稳"：停掉动画、回到首帧，让新页第一帧尽快出来。
+      // 具体调度交给 _ReaderState（mixin 里拿不到 mounted/context）。
+      onPageSettling(page);
+    }
   }
+
+  /// 页码变化时的"停稳检测"钩子，由 _ReaderState 实现。
+  void onPageSettling(int page);
+
+  /// 允许播放动图的页码（null = 当前不允许任何页播动画）。
+  int? animatePage;
 
   bool _validatePage(int page) {
     return page >= 1 && page <= totalPages;
@@ -660,6 +782,10 @@ abstract mixin class _ReaderLocation {
       if (hasAnimation) {
         _pendingPage = page;
         _animationCount++;
+        // 注意顺序：先落 page 再通知，否则 onPageSettling 的定时器
+        // 里 `this.page != page` 恒成立，动画永远不会被允许。
+        this.page = page;
+        onPageSettling(page);
         update();
         _imageViewController!.animateToPage(page).then((_) {
           _animationCount--;
@@ -670,6 +796,7 @@ abstract mixin class _ReaderLocation {
         });
       } else {
         this.page = page;
+        onPageSettling(page);
         update();
         _imageViewController!.toPage(page);
       }

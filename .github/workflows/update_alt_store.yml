@@ -1,15 +1,22 @@
 name: Update AltStore Source
 
+# 上游靠 workflow_run 在 "Build ALL" 完成后自动刷新 alt_store.json 并开 PR。
+#
+# 本分支去掉自动触发，只保留手动：
+#   1. alt_store.json 里的 appID / bundleIdentifier / 下载地址都指向上游
+#      (`com.github.wgh136.venera`、`venera-app/venera/releases`)，本分支
+#      的包名是 `xyz.ezsky.venera`、仓库是 eventhorizonsky/venera，自动跑
+#      只会把上游的 Release 信息再写一遍，产出的 PR 毫无意义；
+#   2. 它会在默认分支上开 PR，而本仓库按 tag 发版，
+#      每次 push tag 都触发一次没人看的 PR 也是纯噪音。
+#
+# 真要用 AltStore 分发，先改 update_alt_store.py 里的 repo_url / appID 再开。
 on:
-  workflow_run:
-    workflows: ["Build ALL"]
-    types: [completed]
   workflow_dispatch:
 
 jobs:
   update-source:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     steps:
     - name: Checkout repository
       uses: actions/checkout@v3

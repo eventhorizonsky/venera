@@ -47,3 +47,9 @@ add_translation.py
 
 */*/generated_*
 */*/Generated*
+# Gradle build reports
+/android/build/
+# 本地构建产物（Go 服务端可执行文件）
+server/venera-nas
+server/venera-nas.exe
+server/*.exe~

@@ -32,6 +32,60 @@ abstract class BaseImageProvider<T extends BaseImageProvider<T>>
     return TargetImageSize(width: width, height: height);
   }
 
+  /// 是否允许播放动图。
+  ///
+  /// 默认 false：超过阈值的动图只解首帧。
+  /// 阅读器会把**当前停留页**设为 true（延迟一段时间后），
+  /// 其余预加载页保持 false，这样既跟手又不会同时跑多个动画 ticker。
+  bool get allowAnimation => false;
+
+  /// 单张动图允许解码占用的最大内存（字节）。
+  ///
+  /// 背景：实测《[DMM.com] 神殺しのアリア》里有 232 个动图 GIF。
+  /// Flutter 的 MultiFrameImageStreamCompleter 会把**所有帧**解进内存
+  /// 并持续播放动画，阅读器默认还预加载 3 张，峰值可达 600MB+，
+  /// 于是整页卡顿、滑动掉帧（用户报告"滑动都会卡顿，尤其它还有 gif"）。
+  ///
+  /// 注意这跟 NAS 无关——源站在线读同一本一样卡。之前误判成
+  /// "NAS 图片没降采样"，实测 getTargetSize 反而更慢（65ms→94ms，
+  /// 因为要先全解码再缩放），那个方向是错的，已回退。
+  ///
+  /// 阈值用**内存字节**而不是像素数：实测同一个目录里既有
+  /// 1080x498 x 108 帧（232MB），也有 380x214 x 301 帧（98MB）。
+  /// 后者像素数不高（24M）但帧数多，按像素判断会漏掉。
+  /// 统一按 帧数 × 单帧 RGBA 字节 来算才准确。
+  static const int maxAnimatedBytes = 24 * 1000 * 1000;
+
+  /// 动图解码后超过 [maxAnimatedBytes] 时只保留首帧。
+  ///
+  /// [forceLimit] 为 true 时不做阈值判断，直接压成首帧
+  /// （用于"这一页还没停留够，先别播动画"的场景）。
+  static Future<ui.Codec> limitAnimatedFrames(
+    ui.Codec codec, {
+    bool forceLimit = false,
+  }) async {
+    if (codec.frameCount <= 1) return codec;
+
+    // 探一帧拿到尺寸（这一帧不保留，后面由包装后的 codec 重新取）
+    final probe = await codec.getNextFrame();
+    final w = probe.image.width;
+    final h = probe.image.height;
+    final frameCount = codec.frameCount;
+    probe.image.dispose();
+
+    // RGBA 每像素 4 字节
+    final bytes = w * h * 4 * frameCount;
+    if (!forceLimit && bytes <= maxAnimatedBytes) return codec;
+
+    Log.info(
+      'Image Loading',
+      'animated image held on first frame: ${w}x$h x $frameCount frames = '
+          '${(bytes / 1e6).toStringAsFixed(0)}MB decoded'
+          '${forceLimit ? ' (page not settled yet)' : ''}',
+    );
+    return _FirstFrameOnlyCodec(codec);
+  }
+
   @override
   ImageStreamCompleter loadImage(T key, ImageDecoderCallback decode) {
     final chunkEvents = StreamController<ImageChunkEvent>();
@@ -104,10 +158,15 @@ abstract class BaseImageProvider<T extends BaseImageProvider<T>>
 
       try {
         final buffer = await ImmutableBuffer.fromUint8List(data);
-        return await decode(
+        final codec = await decode(
           buffer,
           getTargetSize: enableResize ? _getTargetSize : null,
         );
+        // 动图护栏：
+        //   - allowAnimation=true（当前停留页，且已停留够久）→ 原样播放
+        //   - 否则只解首帧，避免预加载多张时同时跑动画、吃爆内存
+        if (allowAnimation) return codec;
+        return await limitAnimatedFrames(codec, forceLimit: true);
       } catch (e) {
         await CacheManager().delete(this.key);
         if (data.length < 2 * 1024) {
@@ -159,6 +218,52 @@ abstract class BaseImageProvider<T extends BaseImageProvider<T>>
 }
 
 typedef FileDecoderCallback = Future<ui.Codec> Function(Uint8List);
+
+/// 只暴露首帧的 [ui.Codec] 包装。
+///
+/// 用于把超大动图降级成静态图：frameCount 报 1，
+/// 后续 getNextFrame 每次都返回同一帧。
+/// MultiFrameImageStreamCompleter 看到 frameCount<=1 就不会再排动画定时器，
+/// 于是既省内存也不再持续占用 CPU。
+///
+/// 实现要点：首帧只解一次并缓存。原 codec 在拿到首帧后立刻 dispose，
+/// 否则它内部仍然持有多帧缓冲。
+class _FirstFrameOnlyCodec implements ui.Codec {
+  _FirstFrameOnlyCodec(this._inner);
+
+  final ui.Codec _inner;
+
+  // 注意：这里用无前缀的 FrameInfo。
+  // 文件顶部 `import 'dart:ui' as ui show Codec;` 只导出了 Codec，
+  // 所以 ui.FrameInfo 不可见；但下一行的 `import 'dart:ui';`
+  // 是无前缀全量导入，FrameInfo 直接可用。
+  FrameInfo? _frame;
+
+  @override
+  int get frameCount => 1;
+
+  @override
+  int get repetitionCount => 0;
+
+  @override
+  Future<FrameInfo> getNextFrame() async {
+    final cached = _frame;
+    if (cached != null) return cached;
+
+    final f = await _inner.getNextFrame();
+    // 把图像留在这里复用，避免每次 build 都重新解码一帧
+    _frame = f;
+    // 原 codec 只取一帧即可释放，避免它继续持有后续帧的解码状态
+    _inner.dispose();
+    return f;
+  }
+
+  @override
+  void dispose() {
+    _frame?.image.dispose();
+    _frame = null;
+  }
+}
 
 class _ImageLoadingStopException implements Exception {
   const _ImageLoadingStopException();

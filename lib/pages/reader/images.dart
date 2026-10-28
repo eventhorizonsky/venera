@@ -38,6 +38,37 @@ class _ReaderImagesState extends State<_ReaderImages> {
   void load() async {
     if (inProgress) return;
     inProgress = true;
+
+    // ---- 离线 NAS 模式：源站视为不可用 ----
+    //
+    // 开关打开且 NAS 可达时，源站请求必然超时。原来的顺序是
+    // "NAS 没缓存 → 回去问源站"，在飞机上就是转圈到天荒地老。
+    // 这里改成：NAS 没缓存就**直接报错**，把"这一章没下过"如实告诉用户。
+    final offlineOnly = NasOfflineMode.instance.preferNasOnly;
+
+    // ---- NAS 优先（新增）----
+    // 优先级：本地已下载 > NAS 缓存 > 源网络加载
+    //
+    // 之所以把 NAS 放在本地之后：本地文件无网络开销，且用户可能刻意保留
+    // 离线副本。NAS 只是"本地没有时更好的来源"。
+    if (reader.type != ComicType.local) {
+      var viaNas = await _tryLoadFromNas();
+      if (viaNas) {
+        _notifyLoadedFromNas();
+        context.readerScaffold.update();
+        return;
+      }
+      if (offlineOnly) {
+        setState(() {
+          error = "This chapter is not cached on NAS.".tl;
+          reader.isLoading = false;
+          inProgress = false;
+        });
+        context.readerScaffold.update();
+        return;
+      }
+    }
+
     if (reader.type == ComicType.local ||
         (LocalManager().isDownloaded(
           reader.cid,
@@ -92,6 +123,72 @@ class _ReaderImagesState extends State<_ReaderImages> {
       }
     }
     context.readerScaffold.update();
+  }
+
+  /// 提示"本章来自 NAS 缓存"。
+  ///
+  /// 阅读器是沉浸式全屏，加载瞬间还在转圈，所以延后一点点等首屏图片出来，
+  /// 否则提示会被 loading 盖住、用户根本看不到。
+  /// 每章只提示一次，翻章不重复打扰。
+  void _notifyLoadedFromNas() {
+    if (!mounted) return;
+    final key = '${reader.cid}_${reader.chapter}';
+    if (!_nasTipShown.add(key)) return;
+    Future.delayed(const Duration(milliseconds: 400), () {
+      if (!mounted) return;
+      context.showMessage(message: "Loaded from NAS".tl);
+    });
+  }
+
+  /// 已提示过 NAS 来源的章节，避免重复弹。
+  final Set<String> _nasTipShown = {};
+
+  /// 尝试从 NAS 读取当前章节。
+  ///
+  /// 返回 true 表示已成功填充 [reader.images]，调用方应直接返回。
+  /// 任何失败（未配置/离线/未缓存/出错）都返回 false，让流程回退到原有逻辑——
+  /// NAS 绝不能成为阅读的阻塞点。
+  Future<bool> _tryLoadFromNas() async {
+    if (!NasClient.instance.isEnabled) return false;
+    // 只有已下载到本地的判定优先，本地没命中才问 NAS
+    if (LocalManager().isDownloaded(
+      reader.cid,
+      reader.type,
+      reader.chapter,
+      reader.widget.chapters,
+    )) {
+      return false;
+    }
+
+    final chapters = reader.widget.chapters;
+    if (chapters == null) return false;
+    final chapterId = chapters.ids.elementAtOrNull(reader.chapter - 1);
+    if (chapterId == null) return false;
+
+    final sourceKey = reader.type.comicSource?.key;
+
+    try {
+      final chapter = await NasClient.instance.findChapter(
+        sourceKey: sourceKey!,
+        comicId: reader.widget.cid,
+        chapterId: chapterId,
+      );
+      if (chapter == null || chapter.pages.isEmpty) return false;
+      if (!mounted) return false;
+      setState(() {
+        reader.images = chapter.pages;
+        reader.isLoading = false;
+        inProgress = false;
+        _handleJumpToLastPage();
+        Future.microtask(() {
+          reader.updateHistory();
+        });
+      });
+      return true;
+    } catch (e) {
+      // NAS 出错一律静默降级
+      return false;
+    }
   }
 
   @override
@@ -208,9 +305,17 @@ class _GalleryModeState extends State<_GalleryMode>
     reader._imageViewController = this;
     Future.microtask(() {
       context.readerScaffold.setFloatingButton(0);
+      // 首屏也要预加载相邻页（builder 里已经不再触发预加载）
+      cache(reader.page);
     });
     super.initState();
   }
+
+  /// 已触发过预加载的页码，避免重复解码。
+  ///
+  /// 与连续模式的 `cached[]` 同义：没有它的话，来回翻同一页会反复
+  /// precacheImage，在 10MB/页 的漫画上代价很明显。
+  final Set<int> _cachedPages = {};
 
   /// Get the range of images for the given page. [page] is 1-based.
   (int start, int end) getPageImagesRange(int page) {
@@ -260,6 +365,7 @@ class _GalleryModeState extends State<_GalleryMode>
 
   void _cachePage(int page, bool shouldPreCache) {
     if (isChapterCommentsPage(page)) return;
+    if (!_cachedPages.add(page)) return; // 已经预加载过
     var (startIndex, endIndex) = getPageImagesRange(page);
     for (int i = startIndex; i < endIndex; i++) {
       shouldPreCache
@@ -326,7 +432,14 @@ class _GalleryModeState extends State<_GalleryMode>
               endIndex,
             );
 
-            cache(index);
+            // 注意：这里**不能**调 cache(index)。
+            //
+            // builder 在滑动动画的每一帧都会被调用（PhotoViewGallery 会
+            // 为当前页 ±1 反复 build），把预加载放在这里等于每帧都触发
+            // 一轮 precacheImage/preDownloadImage。一本 10MB/页 的漫画
+            // 滑动时就是持续的解码风暴，表现为"滑动一直卡"。
+            //
+            // 预加载已改到 onPageChanged 里，每次翻页只做一次。
 
             photoViewControllers[index] ??= PhotoViewController();
 
@@ -392,6 +505,9 @@ class _GalleryModeState extends State<_GalleryMode>
           } else {
             reader.setPage(i);
             context.readerScaffold.update();
+            // 预加载相邻页。放在这里而不是 builder 里：
+            // 每次翻页只跑一次，而不是滑动动画的每一帧都跑。
+            cache(i);
             // Auto close toolbar when entering chapter comments page
             if (isChapterCommentsPage(i) && context.readerScaffold.isOpen) {
               context.readerScaffold.openOrClose();
@@ -1219,13 +1335,23 @@ ImageProvider _createImageProviderFromKey(
   int page,
 ) {
   var reader = context.reader;
+  // 只有"当前停留页 + 已停留够久"才允许播动图。
+  //
+  // 一本动图集（实测某本有 232 个 GIF、单张解码后 98~310MB）里，
+  // 若相邻预加载页也播动画，就会同时跑多个动画 ticker：
+  // 内存爆、CPU 满，翻页和滑动一起卡。这里让其余页只解首帧。
+  //
+  // page 是图片自身的页码（调用方传 startIndex+1），
+  // 与 reader.animatePage（当前允许播放的页）比较即可。
+  final allowAnimation = reader.animatePage == page;
   return ReaderImageProvider(
     imageKey,
     reader.type.comicSource?.key,
     reader.cid,
     reader.eid,
-    reader.page,
-    enableResize: reader.mode.isContinuous, // For continuous mode, we need to resize the image to improve performance
+    page,
+    enableResize: reader.mode.isContinuous,
+    allowAnimation: allowAnimation,
   );
 }
 

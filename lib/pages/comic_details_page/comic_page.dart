@@ -17,6 +17,10 @@ import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/history.dart';
 import 'package:venera/foundation/image_provider/cached_image.dart';
 import 'package:venera/foundation/local.dart';
+import 'package:venera/foundation/log.dart';
+import 'package:venera/foundation/nas_chapter_cache.dart';
+import 'package:venera/foundation/nas_client.dart';
+import 'package:venera/foundation/nas_offline_mode.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/network/download.dart';
 import 'package:venera/network/cache.dart';
@@ -24,6 +28,7 @@ import 'package:venera/pages/favorites/favorites_page.dart';
 import 'package:venera/pages/reader/reader.dart';
 import 'package:venera/utils/file_type.dart';
 import 'package:venera/utils/io.dart';
+import 'package:venera/utils/nas_sync.dart';
 import 'package:venera/utils/tags_translation.dart';
 import 'package:venera/utils/translations.dart';
 import 'dart:math' as math;
@@ -79,6 +84,15 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   bool showFAB = false;
 
+  /// NAS 章节缓存状态。详情页渲染完就开始拉，用于给章节打角标。
+  ///
+  /// 刻意**不**阻塞首屏：NAS 只是增强，离线时必须和原版行为完全一致。
+  @override
+  NasChapterCache? nasCache;
+
+  /// 非空表示当前详情页是"NAS 降级"渲染的（源站不可达）。
+  NasComicFallback? nasFallback;
+
   @override
   void onReadEnd() {
     history ??= HistoryManager().find(
@@ -131,9 +145,36 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     super.initState();
   }
 
+  /// 数据加载完成后启动 NAS 缓存查询。
+  ///
+  /// 放在 buildContent 前而不是 initState：initState 时 comic 还没到手，
+  /// 拿不到标题；而且加载失败（NetworkError）时不该白跑一次 NAS 请求。
+  void _ensureNasCache() {
+    if (nasCache != null) return;
+    final cache = NasChapterCache(
+      sourceKey: widget.sourceKey,
+      comicId: widget.id,
+      title: comic.title,
+    );
+    cache.addListener(_onNasCacheChanged);
+    nasCache = cache;
+    // 不 await：NAS 慢或离线都不该拖住详情页
+    unawaited(cache.load());
+  }
+
+  /// mixin 侧的公开入口（云朵按钮与存储面板用）。
+  @override
+  void ensureNasCache() => _ensureNasCache();
+
+  void _onNasCacheChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
     scrollController.removeListener(onScroll);
+    nasCache?.removeListener(_onNasCacheChanged);
+    nasCache?.dispose();
     super.dispose();
   }
 
@@ -253,16 +294,121 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       widget.id,
       ComicType(widget.sourceKey.hashCode),
     );
-    return comicSource.loadComicInfo!(widget.id);
+
+    // ---- 源站失败时降级到 NAS ----
+    //
+    // 典型场景：pad 上打开一本收藏，源站点超时/被墙/临时故障。
+    // 原版行为是 NetworkError 页面——或者更糟：**一直转圈**。
+    // 后者是这次实测遇到的：picacg 的请求发出去了但永不返回，
+    // loadComicInfo 的 Future 一直挂起，await 永远等不到结果。
+    //
+    // 因此这里必须**主动加超时**，不能指望源自己报错。
+    // 超时时长取 12 秒：足够覆盖正常网络下最慢的详情页，
+    // 又不至于让用户对着转圈等到失去耐心。
+    // ---- 离线 NAS 模式：直接跳源站 ----
+    //
+    // 开了离线模式且 NAS 可达时，源站基本可以断定打不开（机场/地铁）。
+    // 此时先去问源站 = 白等 12 秒超时再降级，体验上就是"点了没反应"。
+    // 所以这里把顺序反过来：先试 NAS，NAS 没有才回去试源站。
+    if (NasOfflineMode.instance.preferNasOnly) {
+      // 短超时：离线模式下 NAS 是第一优先，它在局域网里要么秒回、
+      // 要么根本不在。用默认超时去等一个不在的 NAS 会把
+      // "离线模式"变成"点开详情页卡 25 秒"。
+      final offlineFb = await NasClient.instance.comicFallback(
+        sourceKey: widget.sourceKey,
+        comicId: widget.id,
+        fastTimeout: true,
+      );
+      Log.info(
+        'NAS',
+        'offline mode: fallback for ${widget.sourceKey}/${widget.id} '
+        '=> ${offlineFb == null ? "null" : "${offlineFb.chapters.length} chapters"}',
+      );
+      if (offlineFb != null && !offlineFb.isEmpty) {
+        nasFallback = offlineFb;
+        Log.info(
+          'NAS',
+          'offline mode hit ${widget.sourceKey}/${widget.id}: '
+          '${offlineFb.chapters.length} cached chapters',
+        );
+        return Res(
+          ComicDetails.fromJson(
+            nasFallbackToComicDetailsJson(offlineFb, widget.sourceKey),
+          ),
+        );
+      }
+      // NAS 没这本 → 落到下面的原流程（也许源站其实通）
+    }
+
+    Res<ComicDetails> res;
+    try {
+      // 12 秒对"源站必然失败"的场景（ehentai 未登录、站点被墙）太长：
+      // 用户点进详情页要对着转圈等满 12 秒，体感就是"打不开"。
+      // 8 秒足够覆盖正常网络下最慢的详情页，又能让降级快一点。
+      res = await comicSource
+          .loadComicInfo!(widget.id)
+          .timeout(const Duration(seconds: 8));
+    } catch (e) {
+      Log.info('NAS', 'source loadComicInfo failed/timeout: $e');
+      res = Res.error(e.toString());
+    }
+    if (!res.error) return res;
+
+    if (!NasClient.instance.isEnabled) return res;
+
+    // 源站失败 → 立刻试 NAS 兜底。
+    //
+    // 注意这里**不看**离线模式开关：源站都已经失败了，NAS 有数据就该用。
+    // 之前的实现只在离线模式下才先问 NAS，导致"没开离线模式 + ehentai
+    // 未登录"时，用户要白等超时才看到兜底内容——表现就是
+    // "ehentai 详情页不加载"。
+    //
+    // 短超时：走到这里说明源站已经浪费了时间，不能再等 NAS 默认的
+    // 5s 连接 + 20s 接收。局域网要么秒回要么不在。
+    final fb = await NasClient.instance.comicFallback(
+      sourceKey: widget.sourceKey,
+      comicId: widget.id,
+      fastTimeout: true,
+    );
+    if (fb == null || fb.isEmpty) {
+      // NAS 也没有 → 保持原有错误提示，别把真实原因藏起来
+      Log.info(
+        'NAS',
+        'detail fallback miss for ${widget.sourceKey}/${widget.id} '
+        '(source error: ${res.errorMessage})',
+      );
+      return res;
+    }
+
+    nasFallback = fb;
+    Log.info(
+      'NAS',
+      'detail fallback for ${widget.sourceKey}/${widget.id}: '
+      '${fb.chapters.length} cached chapters',
+    );
+    return Res(
+      ComicDetails.fromJson(
+        nasFallbackToComicDetailsJson(fb, widget.sourceKey),
+      ),
+    );
   }
 
   @override
   Future<void> onDataLoaded() async {
     isLiked = comic.isLiked ?? false;
     isFavorite = comic.isFavorite ?? false;
+    // 收藏状态查询也是一次**源站请求**。
+    //
+    // 离线模式下整个详情页的数据都来自 NAS，此时再去问源站：
+    //   1. 必然超时/失败（这正是用户开离线模式的原因）；
+    //   2. 失败日志飘在页面上，看起来就像"NAS 兜底没生效、还在连源站"。
+    // 所以离线模式下跳过它——收藏状态沿用 NAS 兜底数据里的值。
+    //
     // For sources with multi-folder favorites, prefer querying folders to get accurate favorite status
     // Some sources may not set isFavorite reliably when multi-folder is enabled
-    if (comicSource.favoriteData?.loadFolders != null && comicSource.isLogged) {
+    if (!NasOfflineMode.instance.preferNasOnly &&
+        comicSource.favoriteData?.loadFolders != null &&
+        comicSource.isLogged) {
       var res = await comicSource.favoriteData!.loadFolders!(comic.id);
       if (!res.error) {
         if (res.subData is List) {
@@ -285,6 +431,31 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
         child: Text(comic.title),
       ),
       actions: [
+        // NAS 资源管理入口。
+        //
+        // 显示条件：只要 NAS 已配置就出现，不再要求"已探测到在线"
+        // 或"已有缓存章节"。原因：
+        //   - buildTitle 在 buildChapters 之前执行，首帧时 nasCache
+        //     还没建好（_ensureNasCache 在 buildChapters 里调用），
+        //     用 isAvailable 判断会让按钮在首帧消失、之后再出现；
+        //   - 用户明确诉求："有下载任务或已缓存内容时云朵均出现"，
+        //     NAS 未配置时才隐藏。
+        // 点击后 showNasManage 内部会处理离线/未初始化的情况。
+        if (NasClient.instance.isEnabled)
+          IconButton(
+            tooltip: "NAS Storage".tl,
+            onPressed: () {
+              // 首帧可能还没建立 cache，点的时候补一次并等待
+              _ensureNasCache();
+              showNasManage();
+            },
+            icon: Icon(
+              // 有缓存时用实心云，纯提示"这里能管 NAS"
+              (nasCache?.cachedChapters.isNotEmpty ?? false)
+                  ? Icons.cloud
+                  : Icons.cloud_outlined,
+            ),
+          ),
         IconButton(
           onPressed: showMoreActions,
           icon: const Icon(Icons.more_horiz),
@@ -384,6 +555,14 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
                   text: 'Download'.tl,
                   onPressed: download,
                   iconColor: context.useTextColor(Colors.cyan),
+                ),
+              // 仅在配置了 NAS 时显示，避免打扰未使用该功能的用户
+              if (NasClient.instance.isEnabled && !isDownloaded)
+                _ActionButton(
+                  icon: const Icon(Icons.cloud_download_outlined),
+                  text: 'NAS'.tl,
+                  onPressed: downloadToNas,
+                  iconColor: context.useTextColor(Colors.teal),
                 ),
               if (data!.isLiked != null)
                 _ActionButton(
@@ -697,12 +876,47 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   Widget buildChapters() {
     if (comic.chapters == null) {
-      return const SliverPadding(padding: EdgeInsets.zero);
+      // 单章漫画（绅士漫画等）通常只给预览图、不返回章节列表，
+      // 于是 _ComicChapters 根本不会渲染，"这一章 NAS 有没有缓存"
+      // 就没有地方展示了。这里补一个独立的信息块顶上。
+      //
+      // 注意：这里必须显式启动 NAS 查询。原实现只在下面的
+      // _ComicChapters 分支调用 _ensureNasCache()，单章分支直接
+      // return 了信息栏，但 nasCache 还是 null —— 信息栏内部
+      // 因 cache == null 又把自己隐藏，于是"下载完成后依然显示
+      // 未缓存、还能再次触发下载"（用户实测：契薬交唇 153 页
+      // 已缓存 233MB，详情页仍提示未缓存）。
+      _ensureNasCache();
+      return _NasCacheInfoBar(
+        nasCache: nasCache,
+        comicId: comic.id,
+        sourceKey: widget.sourceKey,
+        title: comic.title,
+      );
     }
+    _ensureNasCache();
     return _ComicChapters(
       history: history,
       groupedMode: comic.chapters!.isGrouped,
+      nasCache: nasCache,
+      nasUncached: _nasUncachedIds,
     );
+  }
+
+  /// 兜底渲染时**明确未缓存**的章节 id 集合。
+  ///
+  /// 只有在 NAS 兜底数据带了源端完整章节表时才非空；此时章节数组
+  /// 与源端一一对应，未缓存的那部分必须灰掉——它们点了也读不到。
+  Set<String>? get _nasUncachedIds {
+    final fb = nasFallback;
+    if (fb == null || !fb.hasFullList) return null;
+    final out = <String>{};
+    for (var i = 0; i < fb.chapters.length; i++) {
+      if (i < fb.cachedFlags.length && !fb.cachedFlags[i]) {
+        out.add(fb.chapters[i].id);
+      }
+    }
+    return out.isEmpty ? null : out;
   }
 
   Widget buildThumbnails() {
