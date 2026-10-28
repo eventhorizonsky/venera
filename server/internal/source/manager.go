@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -565,7 +566,14 @@ func (m *Manager) ensureDomains(h *jshost.Host, key string) {
 			// refreshDomains 内部吞掉了网络异常，只能从静态数组反查结果
 			const d = staticDomains();
 			if (d.length > 0) return JSON.stringify({status: "ok", domains: d});
-			return JSON.stringify({status: "empty"});
+
+			// 走到这里说明发布页没给出域名。最常见的原因是入口页 301：
+			// wn01.link 会跳到当前可用的 wnacg01.link，而服务端的
+			// DefaultClientWithProxy 对跨域重定向一律停在 3xx
+			// （那是为了 exhentai 的登录判断，不能改），于是源脚本里
+			// res.status == 200 的判断不成立，域名列表永远为空。
+			// 这种情况下由服务端自己跟一次重定向，把域名捡回来。
+			return JSON.stringify({status: "retry", domains: []});
 		}
 		if (typeof s.refreshApiDomains === "function") {
 			// jm：init 里按设置刷新过；只有 domainSelection 指向的
@@ -576,6 +584,7 @@ func (m *Manager) ensureDomains(h *jshost.Host, key string) {
 	})()`)
 
 	out := domainHealResult{}
+	retryByOurself := false
 	if err == nil && v != nil {
 		raw := v.String()
 		var parsed struct {
@@ -589,9 +598,22 @@ func (m *Manager) ensureDomains(h *jshost.Host, key string) {
 			if parsed.Error != "" {
 				out.err = parsed.Error
 			}
+			retryByOurself = parsed.Status == "retry"
 		}
 	} else if err != nil {
 		out.err = err.Error()
+	}
+
+	// 源自己没拿到域名（入口页 301 被跨域重定向策略挡住）。
+	// 由服务端直接抓一次发布页、跟随重定向、把域名灌进 JS 环境。
+	if !out.ok && retryByOurself {
+		if domains, derr := m.fetchPublishDomains(); derr == nil && len(domains) > 0 {
+			out.domains = domains
+			out.ok = true
+			m.injectDomains(h, domains)
+		} else if derr != nil {
+			out.err = derr.Error()
+		}
 	}
 
 	if out.ok {
@@ -615,6 +637,95 @@ func (m *Manager) ensureDomains(h *jshost.Host, key string) {
 	if out.ok {
 		m.clampIfOutOfRange(h, key, out.domains)
 	}
+}
+
+// fetchPublishDomains 服务端直接抓发布页，跟随重定向，提取域名列表。
+//
+// 为什么需要这条独立路径：源的 refreshDomains() 用 fetch() 请求入口页，
+// 而服务端的 DefaultClientWithProxy 对**跨域**重定向一律停在 3xx
+// （为 exhentai 的登录判断而设，不能改）。wn01.link 现在会 301 跳到
+// wnacg01.link，于是源里 `if (res.status == 200)` 不成立、域名列表
+// 永远为空，整个 wnacg 源在 NAS 上全灭。
+//
+// 这里用跟随重定向的客户端自己抓一次，把 <a href> 里的域名抄出来。
+func (m *Manager) fetchPublishDomains() ([]string, error) {
+	const entry = "https://wn01.link/"
+
+	client := jshost.DefaultClientWithProxy(m.opts.Proxy)
+	// DefaultClientWithProxy 会拦住跨域重定向，这里需要跟随，
+	// 所以单独构造一个放宽策略的客户端。
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+
+	req, err := http.NewRequest(http.MethodGet, entry, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "+
+		"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch publish page: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("publish page status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+
+	// 只做最朴素的 href 提取，和源脚本用 HtmlDocument 取 a[href] 等价。
+	// 排除发布页自身与统计域名。
+	re := regexp.MustCompile(`https?://([^/"'\s<>]+)`)
+	seen := map[string]bool{}
+	var out []string
+	for _, match := range re.FindAllStringSubmatch(string(body), -1) {
+		host := match[1]
+		if !strings.Contains(host, ".") {
+			continue
+		}
+		low := strings.ToLower(host)
+		if strings.Contains(low, "wn01.link") ||
+			strings.Contains(low, "google") ||
+			strings.Contains(low, "cloudflare") ||
+			strings.Contains(low, "cdn-cgi") {
+			continue
+		}
+		if seen[host] {
+			continue
+		}
+		seen[host] = true
+		out = append(out, host)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no domain found on publish page")
+	}
+	return out, nil
+}
+
+// injectDomains 把服务端抓到的域名灌进当前 JS 环境。
+func (m *Manager) injectDomains(h *jshost.Host, domains []string) {
+	payload, err := json.Marshal(domains)
+	if err != nil {
+		return
+	}
+	_, _ = h.Call(`(async () => {
+		const s = __source;
+		const list = ` + string(payload) + `;
+		if (typeof s.overwriteDomains === "function") {
+			s.overwriteDomains(list);
+		} else if (s.constructor) {
+			s.constructor.domains = list;
+		}
+		return "ok";
+	})()`)
 }
 
 // clampIfOutOfRange 检查 domainSelection 是否超出域名数量，越界则改回第 1 个。
