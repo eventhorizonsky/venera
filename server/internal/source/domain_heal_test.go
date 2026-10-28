@@ -3,6 +3,8 @@ package source
 import (
 	"strings"
 	"testing"
+
+	"github.com/eventhorizonsky/venera/server/internal/jshost"
 )
 
 // flakySourceJS 是一个"发布页能不能访问由设置控制"的源。
@@ -46,30 +48,46 @@ class _Flaky extends ComicSource {
 //	发布页（wn01.link）国内直连不通，必须走代理；NAS 刚启动时代理未必就绪。
 //
 //	现在失败只冷却 domainRetryCooldown，之后会重新尝试。
+//
+// 注意：这里直接断言"自愈状态"，不经过 loadInfo。
+// 走 loadInfo 的话，服务端那条"发布页 301 时自己抓一次"的兜底会真的
+// 去联网拿域名，CI 上恰好能连通 → 加载成功 → 测试前提失效。
 func TestDomainHealRetriesAfterFailure(t *testing.T) {
 	store := &initTestStore{d: map[string]map[string]any{
 		"_flaky": {"settings": map[string]any{"publishUp": false}},
 	}}
 	m := newInitTestManager(t, "_flaky", flakySourceJS, store)
 
-	// 发布页不可达：加载失败，但失败状态必须被记下来（而不是永久放弃）
-	if _, err := m.LoadDetail("_flaky", "1"); err == nil {
-		t.Fatal("loadInfo should fail while domains are empty")
-	}
-	m.mu.RLock()
-	state := m.domainTried["_flaky"]
-	m.mu.RUnlock()
-	if state.ok {
+	// 第一次自愈：拿不到域名，状态必须记为失败
+	runDomainHeal(t, m, "_flaky")
+	if state := domainState(m, "_flaky"); state.ok {
 		t.Fatal("failure must not be recorded as success")
 	}
 
-	// 发布页恢复，并让冷却时间过去（模拟用户过了一会儿点重试）
+	// 失败后处在冷却期内：再调一次不应重新发网络请求，
+	// 这里只验证状态没被误判成成功。
+	runDomainHeal(t, m, "_flaky")
+	if state := domainState(m, "_flaky"); state.ok {
+		t.Fatal("still in cooldown, must not become ok")
+	}
+
+	// 发布页恢复 + 冷却结束 → 必须能重新刷出来
 	setSetting(t, store, "_flaky", "publishUp", true)
 	clearDomainState(m, "_flaky")
+	runDomainHeal(t, m, "_flaky")
 
+	state := domainState(m, "_flaky")
+	if !state.ok {
+		t.Fatalf("must retry after cooldown, state=%+v", state)
+	}
+	if len(state.domains) != 2 || state.domains[0] != "d1.example" {
+		t.Fatalf("healed domains = %v", state.domains)
+	}
+
+	// 域名注入 JS 环境后 loadInfo 能跑通
 	d, err := m.LoadDetail("_flaky", "2")
 	if err != nil {
-		t.Fatalf("must retry after cooldown, got %v", err)
+		t.Fatalf("loadInfo after heal: %v", err)
 	}
 	if !strings.Contains(d.Title, "d1.example") {
 		t.Fatalf("healed domain should be used, got %q", d.Title)
@@ -196,4 +214,27 @@ func clearDomainState(m *Manager, key string) {
 	m.mu.Lock()
 	delete(m.domainTried, key)
 	m.mu.Unlock()
+}
+
+// runDomainHeal 直接跑一次域名自愈，不经过 loadInfo。
+//
+// 单独抽出来是因为 loadInfo 会顺带触发服务端那条"发布页 301 时自己抓
+// 一次"的兜底，那个动作会真的联网；测试要观察的是自愈状态本身，
+// 不能被真实网络影响。
+func runDomainHeal(t *testing.T, m *Manager, key string) {
+	t.Helper()
+	err := m.withHost(key, func(h *jshost.Host) error {
+		// withHost 内部已经跑过 ensureDomains，这里无需额外动作
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withHost(%s): %v", key, err)
+	}
+}
+
+// domainState 读某源的自愈状态。
+func domainState(m *Manager, key string) domainHealState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.domainTried[key]
 }

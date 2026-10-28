@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dop251/goja"
+
 	"github.com/eventhorizonsky/venera/server/internal/jshost"
 	"github.com/eventhorizonsky/venera/server/internal/model"
 )
@@ -606,13 +608,18 @@ func (m *Manager) ensureDomains(h *jshost.Host, key string) {
 
 	// 源自己没拿到域名（入口页 301 被跨域重定向策略挡住）。
 	// 由服务端直接抓一次发布页、跟随重定向、把域名灌进 JS 环境。
+	//
+	// 发布页地址从源脚本自身里取（见 publishEntryURL），不在这里写死：
+	// 写死的话，任何"自身刷新失败"的源都会被拿 wn01.link 的域名去污染。
 	if !out.ok && retryByOurself {
-		if domains, derr := m.fetchPublishDomains(); derr == nil && len(domains) > 0 {
-			out.domains = domains
-			out.ok = true
-			m.injectDomains(h, domains)
-		} else if derr != nil {
-			out.err = derr.Error()
+		if entry := publishEntryURL(h); entry != "" {
+			if domains, derr := m.fetchPublishDomains(entry); derr == nil && len(domains) > 0 {
+				out.domains = domains
+				out.ok = true
+				m.injectDomains(h, domains)
+			} else if derr != nil {
+				out.err = derr.Error()
+			}
 		}
 	}
 
@@ -639,21 +646,45 @@ func (m *Manager) ensureDomains(h *jshost.Host, key string) {
 	}
 }
 
+// publishEntryURL 从源脚本里读出"刷新域名"用的入口页地址。
+//
+// wnacg.js 里写的是 `let url = "https://wn01.link/"`。服务端要自己跟
+// 重定向抓这个页面，但地址不能由 Go 硬编码——否则任何自定义源只要
+// 刷新失败，都会被拿 wnacg 的域名列表污染。
+//
+// 取法：在源脚本里找 refreshDomains 函数体中的第一个 http(s) 字面量。
+// 找不到就返回空串，调用方据此跳过兜底。
+func publishEntryURL(h *jshost.Host) string {
+	v, err := h.Call(`(() => {
+		const s = __source;
+		if (typeof s.refreshDomains !== "function") return "";
+		const src = String(s.refreshDomains);
+		const m = src.match(/https?:\/\/[^\s"'` + "`" + `\\]+/);
+		return m ? m[0] : "";
+	})()`)
+	if err != nil || v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
+		return ""
+	}
+	raw := strings.TrimSpace(v.String())
+	if !strings.HasPrefix(raw, "http") {
+		return ""
+	}
+	return raw
+}
+
 // fetchPublishDomains 服务端直接抓发布页，跟随重定向，提取域名列表。
 //
 // 为什么需要这条独立路径：源的 refreshDomains() 用 fetch() 请求入口页，
-// 而服务端的 DefaultClientWithProxy 对**跨域**重定向一律停在 3xx
+// 而服务端的 DefaultClientWithProxy 对跨域重定向一律停在 3xx
 // （为 exhentai 的登录判断而设，不能改）。wn01.link 现在会 301 跳到
-// wnacg01.link，于是源里 `if (res.status == 200)` 不成立、域名列表
-// 永远为空，整个 wnacg 源在 NAS 上全灭。
+// wnacg01.link，于是源里 res.status == 200 不成立、域名列表永远为空，
+// 整个 wnacg 源在 NAS 上全灭。
 //
-// 这里用跟随重定向的客户端自己抓一次，把 <a href> 里的域名抄出来。
-func (m *Manager) fetchPublishDomains() ([]string, error) {
-	const entry = "https://wn01.link/"
-
+// 这里用跟随重定向的客户端自己抓一次，把 href 里的域名抄出来。
+func (m *Manager) fetchPublishDomains(entry string) ([]string, error) {
 	client := jshost.DefaultClientWithProxy(m.opts.Proxy)
 	// DefaultClientWithProxy 会拦住跨域重定向，这里需要跟随，
-	// 所以单独构造一个放宽策略的客户端。
+	// 所以单独放宽策略。
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return http.ErrUseLastResponse
