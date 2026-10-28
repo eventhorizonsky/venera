@@ -471,14 +471,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: outputs
-          merge-multiple: true
-
-      - name: List collected files
+      # 逐个平台下载，缺哪个都不影响其余产物上架。
+      #
+      # 用 actions/download-artifact 一次性下载时，只要**一个** artifact
+      # 不存在，整个步骤就失败——而"某个平台被取消/失败"恰恰是这个
+      # workflow 设计上允许的情形（见文件头说明）。实测：macOS runner
+      # 排队超时被取消，这一步直接失败，其余 5 个平台的产物也跟着上不了
+      # Release。所以用 gh 按名字逐个取，缺失只告警。
+      - name: Download artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          mkdir -p outputs
+          for name in android macos ios windows linux-x64 linux-arm64; do
+            if gh run download "$GITHUB_RUN_ID" -n "$name" -D outputs 2>/dev/null; then
+              echo "ok: $name"
+            else
+              echo "::warning::artifact '$name' 不可用（对应平台被取消或失败），跳过"
+            fi
+          done
           echo "=== collected ==="
           ls -lhR outputs || true
 

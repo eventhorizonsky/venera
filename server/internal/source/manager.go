@@ -21,6 +21,33 @@ import (
 // ErrSourceNotFound 表示请求的源未安装。
 var ErrSourceNotFound = errors.New("source not found")
 
+// 动态域名自愈的时间参数。
+//
+// 发布页（wn01.link）在国内网络下常常连不上，必须走代理；代理抖动、
+// NAS 刚启动时代理还没就绪都会让一次刷新失败。所以"成功"要能复用、
+// "失败"要能重试，两个都不能是一锤子买卖。
+const (
+	// domainCacheTTL 成功后多久内直接复用，不再打发布页。
+	domainCacheTTL = 6 * time.Hour
+	// domainRetryCooldown 失败后多久内不再重试，避免每个任务都去撞墙。
+	domainRetryCooldown = 2 * time.Minute
+)
+
+// domainHealState 是某个源"动态域名"自愈的结果。
+type domainHealState struct {
+	ok      bool
+	at      time.Time
+	domains []string
+	err     string
+}
+
+// domainHealResult 是 ensureDomains 内部的一次性结果。
+type domainHealResult struct {
+	ok      bool
+	domains []string
+	err     string
+}
+
 // Options 是 Manager 的构造参数。
 type Options struct {
 	DataDir string
@@ -49,8 +76,9 @@ type Manager struct {
 	dataDir string
 	mu      sync.RWMutex
 	scripts map[string]scriptEntry
-	// domainHealed 记录已做过"域名自愈"的源，进程内只做一次。
-	domainHealed map[string]bool
+	// domainTried 记录各源"动态域名"自愈的状态：是否成功、什么时候试的、
+	// 数出来哪些域名。成功结果有 TTL，失败结果有冷却，都可重试。
+	domainTried map[string]domainHealState
 
 	initJS  string
 	store   jshost.SourceDataStore
@@ -487,51 +515,193 @@ func (m *Manager) runInit(h *jshost.Host) error {
 
 // ensureDomains 修复"动态域名"源的空域名问题。
 //
-// wnacg 的域名列表存在 JS 静态变量 Wnacg.domains，只有用户手动点
-// 「刷新域名列表」或打开 refreshDomainsOnStart 才会填充。App 里这是
-// 内存态、进程长存没问题；服务端每个操作都新建 JS 环境（withHost），
-// 域名永远为空 → baseUrl 抛 "Selected domain is unavailable"，
-// wnacg 全部 24 个收藏下载失败。
+// wnacg 的域名列表存在 JS 静态变量 Wnacg.domains，只有用户点
+// 「刷新域名列表」或开着 refreshDomainsOnStart 才会填充。App 里那是
+// 内存态、进程长存，填一次管很久；服务端每个操作都新建 JS 环境
+// （withHost），不补一把，域名永远为空 → baseUrl 抛
+// "Selected domain is unavailable"，整个源的下载全灭。
 //
-// 处理：源带 refreshDomains / refreshApiDomains 且当前域名为空时，
-// 调一次刷新函数填充。结果随 Host 生命周期存活——对本条调用足够；
-// 进程内用 domainHealed 去重，避免每个任务都打一次发布页。
-// jm 的 init() 自己会在域名失效时走 fallbackServers，不受影响。
+// 为什么必须服务端自己取，不能靠同步：
+//   - App 的 overwriteDomains() 只给静态变量赋值，**不写 settings**，
+//     所以手机端刷新出来的域名根本不在 source_data 里，同步不过来；
+//   - domainSelection 同步过来了（比如指向"域名 3"），但被指的那个
+//     数组是空的，"选中的域名不可用"就是这么来的。
+//
+// 刷新失败不能永久放弃：早先这里用 domainHealed 一次性置位，
+// 首次启动时代理还没起来 / 发布页抖一下，这个源就再也不重试了，
+// 用户点"重试"也照样失败。改成带冷却的重试，并缓存成功结果。
 func (m *Manager) ensureDomains(h *jshost.Host, key string) {
 	m.mu.RLock()
-	_, fresh := m.domainHealed[key]
+	last := m.domainTried[key]
 	m.mu.RUnlock()
-	if fresh {
+	// 成功过就不必再试；失败过则冷却一段时间再重新尝试。
+	if last.ok && time.Since(last.at) < domainCacheTTL {
+		m.applyCachedDomains(h, key)
 		return
 	}
+	if !last.ok && time.Since(last.at) < domainRetryCooldown {
+		// 冷却期内直接复用上次数出来的域名（可能为空），不重复打发布页
+		m.applyCachedDomains(h, key)
+		return
+	}
+
 	v, err := h.Call(`(async () => {
 		const s = __source;
-		// 通用判空：静态域名数组挂在类的 static 字段上（Wnacg.domains），
-		// 实例上未必可见，所以按源各自暴露的刷新函数判断。
+		// 拿静态字段必须走 s.constructor，不能写死类名：
+		// 源脚本的类名各不相同（Wnacg / Jm / …），服务端无从得知；
+		// 而且宿主执行的是包在函数里的脚本，类名不在全局作用域上。
+		const cls = s.constructor;
+		const staticDomains = () => {
+			if (!cls || !cls.domains) return [];
+			return Array.isArray(cls.domains) ? cls.domains.slice() : [];
+		};
+
 		if (typeof s.refreshDomains === "function") {
-			if (typeof Wnacg !== "undefined" && Wnacg.domains && Wnacg.domains.length > 0) return "have";
-			await s.refreshDomains(false);
-			return "refreshed";
+			try {
+				await s.refreshDomains(false);
+			} catch (e) {
+				return JSON.stringify({status: "error", error: String(e)});
+			}
+			// refreshDomains 内部吞掉了网络异常，只能从静态数组反查结果
+			const d = staticDomains();
+			if (d.length > 0) return JSON.stringify({status: "ok", domains: d});
+			return JSON.stringify({status: "empty"});
 		}
 		if (typeof s.refreshApiDomains === "function") {
 			// jm：init 里按设置刷新过；只有 domainSelection 指向的
 			// 域名取不到时才需要再刷（refreshApiDomains 内部有兜底）。
-			return "skip";
+			return JSON.stringify({status: "skip"});
 		}
-		return "none";
+		return JSON.stringify({status: "none"});
 	})()`)
-	if err != nil {
-		// 刷新失败不阻塞下载：源会给出原本的错误信息
-		m.logf("warning", "domain heal", fmt.Sprintf("%s: %v", key, err))
+
+	out := domainHealResult{}
+	if err == nil && v != nil {
+		raw := v.String()
+		var parsed struct {
+			Status  string   `json:"status"`
+			Error   string   `json:"error"`
+			Domains []string `json:"domains"`
+		}
+		if json.Unmarshal([]byte(raw), &parsed) == nil {
+			out.domains = parsed.Domains
+			out.ok = parsed.Status == "ok" && len(parsed.Domains) > 0
+			if parsed.Error != "" {
+				out.err = parsed.Error
+			}
+		}
+	} else if err != nil {
+		out.err = err.Error()
 	}
+
+	if out.ok {
+		m.logf("info", "domain heal", fmt.Sprintf("%s: %d domains", key, len(out.domains)))
+	} else if out.err != "" {
+		m.logf("warning", "domain heal", fmt.Sprintf("%s: %s", key, out.err))
+	}
+
 	m.mu.Lock()
-	if m.domainHealed == nil {
-		m.domainHealed = map[string]bool{}
+	if m.domainTried == nil {
+		m.domainTried = map[string]domainHealState{}
 	}
-	m.domainHealed[key] = true
+	m.domainTried[key] = domainHealState{ok: out.ok, at: time.Now(), domains: out.domains}
 	m.mu.Unlock()
-	_ = v
+
+	// 刷新成功后同样要检查 domainSelection 是否越界。
+	//
+	// 这条路径和 applyCachedDomains 是两回事：这里是"刚打完发布页"，
+	// 那里是"复用上次的结果"。用户的选择越界时两边都要纠正，
+	// 只在缓存路径上纠正的话，首次刷新永远修不好。
+	if out.ok {
+		m.clampIfOutOfRange(h, key, out.domains)
+	}
 }
+
+// clampIfOutOfRange 检查 domainSelection 是否超出域名数量，越界则改回第 1 个。
+func (m *Manager) clampIfOutOfRange(h *jshost.Host, key string, domains []string) {
+	if len(domains) == 0 {
+		return
+	}
+	v, err := h.Call(`(async () => {
+		const s = __source;
+		let sel = s.loadSetting("domainSelection");
+		if (sel === undefined || sel === null) sel = 0;
+		sel = parseInt(sel);
+		if (isNaN(sel)) sel = 0;
+		return JSON.stringify({sel: sel});
+	})()`)
+	if err != nil || v == nil {
+		return
+	}
+	var parsed struct {
+		Sel int `json:"sel"`
+	}
+	if json.Unmarshal([]byte(v.String()), &parsed) != nil {
+		return
+	}
+	// sel == 0 表示"用自定义域名"，与数组长度无关，不算越界
+	if parsed.Sel > 0 && parsed.Sel-1 >= len(domains) {
+		m.clampDomainSelection(key)
+	}
+}
+
+// applyCachedDomains 把上次刷新成功的域名灌回这次新建的 JS 环境。
+//
+// refreshDomains 拿到的是域名列表，真正生效还得走 overwriteDomains
+// （就是源自己那个 "Apply" 按钮干的事）。不灌的话，冷却期内的每次
+// 调用依然面对空数组、依然报 "Selected domain is unavailable"。
+func (m *Manager) applyCachedDomains(h *jshost.Host, key string) {
+	m.mu.RLock()
+	state := m.domainTried[key]
+	m.mu.RUnlock()
+	if len(state.domains) == 0 {
+		return
+	}
+	payload, err := json.Marshal(state.domains)
+	if err != nil {
+		return
+	}
+	_, _ = h.Call(`(async () => {
+		const s = __source;
+		const cls = s.constructor;
+		const list = ` + string(payload) + `;
+		if (typeof s.overwriteDomains === "function") {
+			s.overwriteDomains(list);
+		} else if (cls) {
+			cls.domains = list;
+		}
+		return "ok";
+	})()`)
+	m.clampIfOutOfRange(h, key, state.domains)
+}
+
+// clampDomainSelection 把 domainSelection 修正为合法下标（第 1 个域名）。
+//
+// 只在 applyCachedDomains 判定越界时调用。读-改-写只动 domainSelection
+// 这一个键，不碰同级的 domain0 / refreshDomainsOnStart。
+func (m *Manager) clampDomainSelection(key string) {
+	if m.opts.Store == nil {
+		return
+	}
+	data, err := m.opts.Store.GetSourceData(key)
+	if err != nil {
+		return
+	}
+	settings, _ := data["settings"].(map[string]any)
+	if settings == nil {
+		settings = map[string]any{}
+	}
+	if fmt.Sprint(settings["domainSelection"]) == "1" {
+		return
+	}
+	settings["domainSelection"] = "1"
+	if err := m.opts.Store.MergeSourceData(key, map[string]any{"settings": settings}); err != nil {
+		m.logf("warning", "clamp domain", fmt.Sprintf("%s: %v", key, err))
+		return
+	}
+	m.logf("info", "clamp domain", key+": domainSelection -> 1（原选择超出域名数量）")
+}
+
 
 // ---------- 源方法封装 ----------
 

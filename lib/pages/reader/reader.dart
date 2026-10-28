@@ -376,39 +376,35 @@ class _ReaderState extends State<Reader>
   @override
   Widget build(BuildContext context) {
     _checkImagesPerPageChange();
-    // 返回键由阅读器自己接管，只弹自己这一层。
+    // 返回完全交给框架，这一层**不要**用 PopScope 拦截。
     //
-    // 之前这里是裸的，返回完全交给框架处理。阅读器压在根 Navigator 上、
-    // 详情页压在内层 Navigator 上，两层各自都"可以 pop"；Android 13+
-    // 的预测式返回会把同一次返回同时触发给根路由和下层 PopScope 的转发，
-    // 于是阅读器弹掉之后，详情页跟着又被弹了一次——用户看到的就是
-    // "从阅读器返回，没回到详情页，直接往上退了一级"。
+    // 踩过的坑：为了让"从阅读器返回别连带弹掉详情页"，这里曾经写成
+    // PopScope(canPop: false) + 手动 pop()。按钮路径看着正常，但手势
+    // 路径崩了——manifest 里开了 enableOnBackInvokedCallback="true"
+    // （Android 13+ 预测式返回），canPop:false 会让系统把手势拆成两段：
+    // 先是"预测"动画被取消（用户看到的是第一次滑动没反应），
+    // 之后回调里的 pop() 才生效，紧接着第二次手势又正常 pop 一层，
+    // 于是"第一次无反应、第二次连退两次"。
     //
-    // canPop: false 把这次 pop 变成"框架不自己动手，由我们显式做一次"，
-    // 保证一次返回只弹一层。
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, result) {
-        if (didPop) return;
-        Navigator.of(context).pop();
-      },
-      child: KeyboardListener(
-        focusNode: focusNode,
-        autofocus: true,
-        onKeyEvent: onKeyEvent,
-        child: Overlay(
-          initialEntries: [
-            OverlayEntry(
-              builder: (context) {
-                return _ReaderScaffold(
-                  child: _ReaderGestureDetector(
-                    child: _ReaderImages(key: Key(chapter.toString())),
-                  ),
-                );
-              },
-            ),
-          ],
-        ),
+    // 真正该防的是内层（MainPage）把同一次返回再转发给子 Navigator，
+    // 那个判断在 navigation_bar.dart 的 PopScope 里，用宿主路由
+    // isCurrent 拦住。此处保持默认行为即可。
+    return KeyboardListener(
+      focusNode: focusNode,
+      autofocus: true,
+      onKeyEvent: onKeyEvent,
+      child: Overlay(
+        initialEntries: [
+          OverlayEntry(
+            builder: (context) {
+              return _ReaderScaffold(
+                child: _ReaderGestureDetector(
+                  child: _ReaderImages(key: Key(chapter.toString())),
+                ),
+              );
+            },
+          ),
+        ],
       ),
     );
   }
