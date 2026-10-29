@@ -613,17 +613,17 @@ class RootPopStamp {
   /// 变化通知，让 NaviPane 重建 PopScope 的 canPop。
   static final ValueNotifier<int> revision = ValueNotifier<int>(0);
 
+  /// 由 [RootPopObserver] 调用。
+  static void setHasRouteAbove(bool value) {
+    if (value == hasRouteAbove) return;
+    hasRouteAbove = value;
+    revision.value++;
+  }
+
   /// 由根 Navigator 的 observer 在每次 didPop/didPush 后调用。
   static void mark() => _last = DateTime.now();
 
   /// 根据根 Navigator 现状刷新 [hasRouteAbove]。
-  static void sync(NavigatorState? nav) {
-    final above = nav?.canPop() ?? false;
-    if (above == hasRouteAbove) return;
-    hasRouteAbove = above;
-    revision.value++;
-  }
-
   /// 根层是否刚弹过一层（即当前这次返回大概已经被消费掉了）。
   static bool consumedRecently() {
     final last = _last;
@@ -633,37 +633,40 @@ class RootPopStamp {
 }
 
 /// 挂在根 Navigator 上的 observer：维护 [RootPopStamp]。
+///
+/// 关键点：**自己维护一份"根层压着几个路由"的计数**，不去问
+/// navigator.canPop()。原因是 canPop() 在 didPush/didPop 回调的时刻
+/// 反映的还是变动前/后的中间状态，实测在返回手势下读到的值会让
+/// hasRouteAbove 变成 false —— 于是内层 PopScope 照常吃掉返回、
+/// 把详情页也弹掉，正是"阅读器里返回越过详情页"。
 class RootPopObserver extends NavigatorObserver {
-  void _sync(NavigatorState? nav) {
-    // 路由栈变动发生在这一帧之后，等下一帧再读 canPop
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      RootPopStamp.sync(nav);
-    });
+  /// 根 Navigator 上除首页之外压着的路由数。
+  static int aboveCount = 0;
+
+  void _bump(int delta) {
+    aboveCount = (aboveCount + delta).clamp(0, 1000);
+    RootPopStamp.setHasRouteAbove(aboveCount > 0);
+  }
+
+  @override
+  void didPush(Route route, Route? previousRoute) {
+    super.didPush(route, previousRoute);
+    // 第一个路由是 MainPage 自己，不算"压在上面"
+    if (previousRoute != null) _bump(1);
   }
 
   @override
   void didPop(Route route, Route? previousRoute) {
     RootPopStamp.mark();
-    _sync(navigator);
     super.didPop(route, previousRoute);
-  }
-
-  @override
-  void didPush(Route route, Route? previousRoute) {
-    _sync(navigator);
-    super.didPush(route, previousRoute);
+    // previousRoute 为 null 表示把最后一个路由也弹了（不该发生）
+    if (previousRoute != null) _bump(-1);
   }
 
   @override
   void didRemove(Route route, Route? previousRoute) {
-    _sync(navigator);
     super.didRemove(route, previousRoute);
-  }
-
-  @override
-  void didReplace({Route? newRoute, Route? oldRoute}) {
-    _sync(navigator);
-    super.didReplace(newRoute: newRoute, oldRoute: oldRoute);
+    if (previousRoute != null) _bump(-1);
   }
 }
 
@@ -682,7 +685,7 @@ class NaviObserver extends NavigatorObserver implements Listenable {
 
   @override
   void didPop(Route route, Route? previousRoute) {
-    routes.removeLast();
+    if (routes.isNotEmpty) routes.removeLast();
     notifyListeners();
   }
 
