@@ -278,14 +278,34 @@ class NaviPaneState extends State<NaviPane>
             }
             return false;
           },
-          child: Navigator(
-            observers: [widget.observer],
-            key: widget.navigatorKey,
-            onGenerateRoute: (settings) => AppPageRoute(
-              preventRebuild: false,
-              builder: (context) {
-                return _NaviMainView(state: this);
-              },
+          // 手势返回（预测式返回）会**绕过 PopScope，甚至绕过 onPopPage**，
+          // 直接对嵌套 Navigator 派发 pop。实测日志顺序：
+          //
+          //   手势：[INNER pop] → [ROOT pop]   ← 详情页先被弹掉
+          //   按键：[ROOT pop]                 ← 内层不动
+          //
+          // 并且 onPopPage 根本不会被调用（一条日志都没有），说明系统在
+          // Navigator 内部直接把路由移除了。所以只能靠 PopScope 层面挡住：
+          // 根层有页面压着时，把这一整层的 canPop 设为 false。
+          //
+          // 上面的 PopScope 已经这么做了（canPop: _canPop && !hasRouteAbove），
+          // 但内层 Navigator 自己仍会被系统单独派发。因此这里用
+          // NavigatorPopHandler 把"是否处理返回"统一到 enabled 上：
+          // 根层有页面 → enabled=false，本层完全不参与系统返回。
+          child: NavigatorPopHandler<dynamic>(
+            enabled: !RootPopStamp.hasRouteAbove,
+            onPopWithResult: (result) {
+              widget.navigatorKey.currentState?.maybePop(result);
+            },
+            child: Navigator(
+              observers: [widget.observer],
+              key: widget.navigatorKey,
+              onGenerateRoute: (settings) => AppPageRoute(
+                preventRebuild: false,
+                builder: (context) {
+                  return _NaviMainView(state: this);
+                },
+              ),
             ),
           ),
         ),
@@ -591,47 +611,6 @@ class _SingleBottomNaviWidgetState extends State<_SingleBottomNaviWidget>
   }
 }
 
-/// 记录"根 Navigator 刚弹掉过一层"，以及根层当前是否有页面压着。
-///
-/// 存在的理由：安卓全局返回一次只应退一层。阅读器压在根 Navigator 上、
-/// 详情页压在内层 Navigator 上时，同一次返回会先弹掉阅读器，随后还能
-/// 传到内层那圈 PopScope，把详情页也弹掉。两层各自的 isCurrent 判断在
-/// 事件传递的瞬间都不能可靠区分"这是不是同一次返回"。
-///
-/// 这里同时提供两样东西：
-///   - hasRouteAbove：根层此刻是否还有页面压着（阅读器/弹层）。有的话，
-///     MainPage 那圈 PopScope 一律声明 canPop:false，不参与返回处理。
-///   - consumedRecently：根层刚弹过一层的时间窗兜底。
-class RootPopStamp {
-  static DateTime? _last;
-
-  static const _window = Duration(milliseconds: 400);
-
-  /// 根层是否有路由压在 MainPage 之上。
-  static bool hasRouteAbove = false;
-
-  /// 变化通知，让 NaviPane 重建 PopScope 的 canPop。
-  static final ValueNotifier<int> revision = ValueNotifier<int>(0);
-
-  /// 由 [RootPopObserver] 调用。
-  static void setHasRouteAbove(bool value) {
-    if (value == hasRouteAbove) return;
-    hasRouteAbove = value;
-    revision.value++;
-  }
-
-  /// 由根 Navigator 的 observer 在每次 didPop/didPush 后调用。
-  static void mark() => _last = DateTime.now();
-
-  /// 根据根 Navigator 现状刷新 [hasRouteAbove]。
-  /// 根层是否刚弹过一层（即当前这次返回大概已经被消费掉了）。
-  static bool consumedRecently() {
-    final last = _last;
-    if (last == null) return false;
-    return DateTime.now().difference(last) < _window;
-  }
-}
-
 /// 挂在根 Navigator 上的 observer：维护 [RootPopStamp]。
 ///
 /// 关键点：**自己维护一份"根层压着几个路由"的计数**，不去问
@@ -688,7 +667,6 @@ class NaviObserver extends NavigatorObserver implements Listenable {
     if (routes.isNotEmpty) routes.removeLast();
     notifyListeners();
   }
-
   @override
   void didPush(Route route, Route? previousRoute) {
     routes.addLast(route);

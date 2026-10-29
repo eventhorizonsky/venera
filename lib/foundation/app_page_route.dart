@@ -4,6 +4,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/root_pop_stamp.dart';
 
 const double _kBackGestureWidth = 20.0;
 const int _kMaxDroppedSwipePageForwardAnimationTime = 800;
@@ -137,6 +138,45 @@ mixin _AppRouteTransitionMixin<T> on PageRoute<T> {
         child: child,
         )
       : child);
+  }
+
+  /// 根层压着页面（阅读器、弹层）时，本路由不接受预测式返回手势。
+  ///
+  /// 这是"手势返回多退一层"的根因修法。Flutter 的预测式返回检测器是
+  /// **每个 Route 各挂一份**，启用条件为
+  /// `route.isCurrent && route.popGestureEnabled`
+  /// （_PredictiveBackGestureDetectorState._isEnabled），而系统的手势事件
+  /// 是广播给所有注册者的。
+  ///
+  /// 本 App 有两层 Navigator：
+  ///   根层:   [MainPage, Reader]
+  ///   内层:   [列表页, ComicPage]      ← 详情页
+  /// 阅读器压在根层时，详情页在内层里**依然是 isCurrent**，于是两个检测器
+  /// 同时启用 —— 一次侧滑，阅读器和详情页各 pop 一次，用户看到的就是
+  /// "从阅读页返回越过详情页直接退回列表"。按键返回不走预测式通道，
+  /// 所以只有手势出问题。
+  ///
+  /// popGestureEnabled 在**每次手势开始时实时求值**（不是构建时缓存），
+  /// 因此在这里加一个根层状态判断就能精确生效，不需要重建路由。
+  ///
+  /// 注意"根层路由"和"内层路由"要区别对待：压在根层的阅读器**必须**保留
+  /// 手势（它就是这一层该被手势关掉的那一个），要被禁掉的只是内层那条。
+  @override
+  bool get popGestureEnabled {
+    if (RootPopStamp.hasRouteAbove && !_isOnRootNavigator) {
+      return false;
+    }
+    return super.popGestureEnabled;
+  }
+
+  /// 本路由是否挂在根 Navigator 上。
+  ///
+  /// 根层路由（MainPage、阅读器、全屏弹层）保留预测式手势；内层路由
+  /// （详情页等）在根层有页面时让位，避免同一次手势被两层各 pop 一次。
+  bool get _isOnRootNavigator {
+    final nav = navigator;
+    if (nav == null) return true;
+    return identical(nav, App.rootNavigatorKey.currentState);
   }
 
   IOSBackGestureController _startPopGesture(PageRoute<T> route) {
