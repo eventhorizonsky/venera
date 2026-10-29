@@ -132,13 +132,21 @@ class NaviPaneState extends State<NaviPane>
       vsync: this,
     );
     widget.observer.addListener(onNavigatorStateChange);
+    // 根层路由栈变化时重建：canPop 依赖 RootPopStamp.hasRouteAbove，
+    // 阅读器压上来 / 退出去都要让这里的 PopScope 重新取一次值。
+    RootPopStamp.revision.addListener(_onRootStackChanged);
     super.initState();
+  }
+
+  void _onRootStackChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     controller.dispose();
     widget.observer.removeListener(onNavigatorStateChange);
+    RootPopStamp.revision.removeListener(_onRootStackChanged);
     super.dispose();
   }
 
@@ -227,7 +235,13 @@ class NaviPaneState extends State<NaviPane>
     return HeroControllerScope(
       controller: MaterialApp.createMaterialHeroController(),
       child: PopScope(
-        canPop: _canPop,
+        // 根 Navigator 上还压着页面（阅读器等）时，本层绝不能声明
+        // "我能拦返回"——那会让框架把同一次返回继续分发给内层。
+        //
+        // 这是"一次返回退两层"的另一半修法：canPop 直接取 false 时，
+        // 即使 onPopInvokedWithResult 里提前 return，框架仍已把本层当成
+        // 返回的目标层，进而波及内层 Navigator。所以在这里就把门关上。
+        canPop: _canPop && !RootPopStamp.hasRouteAbove,
         onPopInvokedWithResult: (didPop, result) {
           if (didPop) {
             return;
@@ -235,12 +249,19 @@ class NaviPaneState extends State<NaviPane>
           // 根 Navigator 上还压着别的页面（阅读器、弹层页）时，这一次返回
           // 属于那一层，本层不能转发。
           //
-          // 不判断的话会出现"从阅读器返回，详情页跟着一起被弹掉"：
-          // 阅读器在根 Navigator 上，按一次返回本该只弹它；但本层拿到的
-          // 是同一个返回事件，于是又往内层 Navigator 里 maybePop 了一次，
-          // 内层的详情页就被顺手弹掉，用户看到的就是"直接往上退了一级"。
-          // isCurrent 在这里是准确的判据——MainPage 是根 Navigator 的首个
-          // 路由，只有在没有页面压在它上面时它才是 current。
+          // 为什么需要三重判断：
+          //
+          // 1) _rootHasNoRouteAbove：根层还有页面时根本不该走到这里
+          //    （canPop 已为 false）。
+          // 2) isCurrent：正常情况下的判据。MainPage 是根 Navigator 的
+          //    首个路由，只有没有页面压在它上面时它才是 current。
+          // 3) 时间窗：都不够时兜底。实测（Android 15 + 预测式返回）里，
+          //    根层弹出阅读器之后同一个返回事件还会继续传到本层，此时
+          //    MainPage 已重新变成 current。RootPopStamp 由根 Navigator
+          //    的 observer 打点，根层刚弹过就让本层拒绝转发。
+          if (RootPopStamp.consumedRecently()) {
+            return;
+          }
           final hostRoute = ModalRoute.of(context);
           if (hostRoute != null && !hostRoute.isCurrent) {
             return;
@@ -271,6 +292,13 @@ class NaviPaneState extends State<NaviPane>
       ),
     );
   }
+
+  /// 根 Navigator 上是否没有别的路由压着（即 MainPage 就是最上层）。
+  ///
+  /// 用 navigator 的路由栈直接判断，不依赖 PopScope 的回调时序：
+  /// 阅读器、弹层页压在根上时返回 false，本层就不参与返回处理。
+  /// 结果由 RootPopObserver 在每次路由变动后同步到 RootPopStamp。
+
 
   Widget buildMainViewContent() {
     return widget.pageBuilder(currentPage);
@@ -560,6 +588,82 @@ class _SingleBottomNaviWidgetState extends State<_SingleBottomNaviWidget>
         ),
       ),
     );
+  }
+}
+
+/// 记录"根 Navigator 刚弹掉过一层"，以及根层当前是否有页面压着。
+///
+/// 存在的理由：安卓全局返回一次只应退一层。阅读器压在根 Navigator 上、
+/// 详情页压在内层 Navigator 上时，同一次返回会先弹掉阅读器，随后还能
+/// 传到内层那圈 PopScope，把详情页也弹掉。两层各自的 isCurrent 判断在
+/// 事件传递的瞬间都不能可靠区分"这是不是同一次返回"。
+///
+/// 这里同时提供两样东西：
+///   - hasRouteAbove：根层此刻是否还有页面压着（阅读器/弹层）。有的话，
+///     MainPage 那圈 PopScope 一律声明 canPop:false，不参与返回处理。
+///   - consumedRecently：根层刚弹过一层的时间窗兜底。
+class RootPopStamp {
+  static DateTime? _last;
+
+  static const _window = Duration(milliseconds: 400);
+
+  /// 根层是否有路由压在 MainPage 之上。
+  static bool hasRouteAbove = false;
+
+  /// 变化通知，让 NaviPane 重建 PopScope 的 canPop。
+  static final ValueNotifier<int> revision = ValueNotifier<int>(0);
+
+  /// 由根 Navigator 的 observer 在每次 didPop/didPush 后调用。
+  static void mark() => _last = DateTime.now();
+
+  /// 根据根 Navigator 现状刷新 [hasRouteAbove]。
+  static void sync(NavigatorState? nav) {
+    final above = nav?.canPop() ?? false;
+    if (above == hasRouteAbove) return;
+    hasRouteAbove = above;
+    revision.value++;
+  }
+
+  /// 根层是否刚弹过一层（即当前这次返回大概已经被消费掉了）。
+  static bool consumedRecently() {
+    final last = _last;
+    if (last == null) return false;
+    return DateTime.now().difference(last) < _window;
+  }
+}
+
+/// 挂在根 Navigator 上的 observer：维护 [RootPopStamp]。
+class RootPopObserver extends NavigatorObserver {
+  void _sync(NavigatorState? nav) {
+    // 路由栈变动发生在这一帧之后，等下一帧再读 canPop
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      RootPopStamp.sync(nav);
+    });
+  }
+
+  @override
+  void didPop(Route route, Route? previousRoute) {
+    RootPopStamp.mark();
+    _sync(navigator);
+    super.didPop(route, previousRoute);
+  }
+
+  @override
+  void didPush(Route route, Route? previousRoute) {
+    _sync(navigator);
+    super.didPush(route, previousRoute);
+  }
+
+  @override
+  void didRemove(Route route, Route? previousRoute) {
+    _sync(navigator);
+    super.didRemove(route, previousRoute);
+  }
+
+  @override
+  void didReplace({Route? newRoute, Route? oldRoute}) {
+    _sync(navigator);
+    super.didReplace(newRoute: newRoute, oldRoute: oldRoute);
   }
 }
 

@@ -6,7 +6,7 @@ publish_to: 'none'
 # 同一份数字的两个人肉维护处，改一个要同时改另一个。
 # 更新检测读的正是本仓库分支上这个文件的 version，再与 App.version 比对；
 # 两边对不上就会出现"装到最新版还一直提示有新版本、下载到的还是同一个包"。
-version: 1.6.6+166
+version: 1.6.7+167
 
 environment:
   # Dart SDK 下限保持宽松（3.8），实际由下面的 flutter 约束决定。

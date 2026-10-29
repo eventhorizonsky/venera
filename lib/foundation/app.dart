@@ -18,7 +18,7 @@ class _App {
   /// **必须与 pubspec.yaml 的 `version:`（去掉 `+build`）保持一致。**
   /// 更新检测读的是本仓库分支上的 pubspec，拿它和这里的值比；两边不一致
   /// 就会出现"装到最新版还一直提示有新版本、点进去下载的还是同一个包"。
-  final version = "1.6.6";
+  final version = "1.6.7";
 
   bool get isAndroid => Platform.isAndroid;
 

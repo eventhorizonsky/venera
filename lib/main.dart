@@ -204,6 +204,9 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
         debugShowCheckedModeBanner: false,
         theme: getTheme(primary, secondary, tertiary, Brightness.light),
         navigatorKey: App.rootNavigatorKey,
+        // 只用来记录"根层刚弹掉过一层"，让内层不再消费同一次返回。
+        // 见 components/navigation_bar.dart 里 RootPopStamp 的说明。
+        navigatorObservers: [RootPopObserver()],
         darkTheme: getTheme(primary, secondary, tertiary, Brightness.dark),
         themeMode: switch (appdata.settings['theme_mode']) {
           'light' => ThemeMode.light,
