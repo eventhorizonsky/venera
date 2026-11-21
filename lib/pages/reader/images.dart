@@ -39,18 +39,15 @@ class _ReaderImagesState extends State<_ReaderImages> {
     if (inProgress) return;
     inProgress = true;
 
-    // ---- 离线 NAS 模式：源站视为不可用 ----
+    // ---- 离线 NAS 模式：只改变**请求顺序**，不是"禁用源站" ----
     //
-    // 开关打开且 NAS 可达时，源站请求必然超时。原来的顺序是
-    // "NAS 没缓存 → 回去问源站"，在飞机上就是转圈到天荒地老。
-    // 这里改成：NAS 没缓存就**直接报错**，把"这一章没下过"如实告诉用户。
-    final offlineOnly = NasOfflineMode.instance.preferNasOnly;
-
-    // ---- NAS 优先（新增）----
-    // 优先级：本地已下载 > NAS 缓存 > 源网络加载
+    // 旧实现在 NAS 没缓存时直接报错中止（"This chapter is not cached on NAS."），
+    // 这是把"优先从 NAS 取"误解成了"只允许 NAS"。后果：用户在离线模式下
+    // 打开一本没缓存过的漫画，明明网络是通的，却被强行拦下。
     //
-    // 之所以把 NAS 放在本地之后：本地文件无网络开销，且用户可能刻意保留
-    // 离线副本。NAS 只是"本地没有时更好的来源"。
+    // 现在语义明确：NAS 优先尝试一次，没命中就**照常回落到源站网络**，
+    // 与未开启离线模式时行为一致。离线模式仅仅把顺序从
+    // "源站 → NAS" 换成 "NAS → 源站"，不改变任何可用性。
     if (reader.type != ComicType.local) {
       var viaNas = await _tryLoadFromNas();
       if (viaNas) {
@@ -58,15 +55,7 @@ class _ReaderImagesState extends State<_ReaderImages> {
         context.readerScaffold.update();
         return;
       }
-      if (offlineOnly) {
-        setState(() {
-          error = "This chapter is not cached on NAS.".tl;
-          reader.isLoading = false;
-          inProgress = false;
-        });
-        context.readerScaffold.update();
-        return;
-      }
+      // NAS 未命中 → 继续往下走正常流程（本地已下载 → 源站网络）。
     }
 
     if (reader.type == ComicType.local ||
