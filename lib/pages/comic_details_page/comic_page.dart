@@ -3,7 +3,6 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:photo_view/photo_view.dart';
-import 'package:shimmer_animation/shimmer_animation.dart';
 import 'package:sliver_tools/sliver_tools.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:venera/components/components.dart';
@@ -1197,7 +1196,7 @@ class _ComicPageLoadingPlaceHolder extends StatelessWidget {
       );
     }
 
-    return Shimmer(
+    return SkeletonShimmer(
       color: context.isDarkMode ? Colors.grey.shade700 : Colors.white,
       child: Column(
         children: [

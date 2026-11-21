@@ -227,7 +227,7 @@ class _NetworkSectionState extends State<_NetworkSection> {
             ),
           ),
         ),
-        Shimmer(
+        SkeletonShimmer(
           child: Column(
             children: List.generate(3, (index) {
               return ListTile(

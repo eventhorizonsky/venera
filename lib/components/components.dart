@@ -51,3 +51,4 @@ part 'comic.dart';
 part 'effects.dart';
 part 'gesture.dart';
 part 'code.dart';
+part 'skeleton_shimmer.dart';
