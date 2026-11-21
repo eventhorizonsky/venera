@@ -27,6 +27,7 @@ class SkeletonShimmer extends StatefulWidget {
     this.opacity = 0.3,
     this.duration = const Duration(milliseconds: 1500),
     this.interval = Duration.zero,
+    this.enabled = true,
   });
 
   /// 被罩上流光的骨架内容。**不会被重建**。
@@ -43,6 +44,12 @@ class SkeletonShimmer extends StatefulWidget {
 
   /// 两次扫过之间的间隔。
   final Duration interval;
+
+  /// 是否启用流光动画。
+  ///
+  /// 设为 false 时**完全不建 CustomPaint、不跑 Ticker**，只原样返回 child。
+  /// 用于对照实验：确认骨架的发光绘制是不是光栅线程(raster)超时的来源。
+  final bool enabled;
 
   @override
   State<SkeletonShimmer> createState() => _SkeletonShimmerState();
@@ -92,21 +99,43 @@ class _SkeletonShimmerState extends State<SkeletonShimmer>
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _animation,
-      // child 只创建一次，之后每帧原样复用，不参与重建。
-      child: widget.child,
-      builder: (context, child) {
-        return CustomPaint(
-          // 前景绘制：流光盖在骨架上
-          foregroundPainter: _SkeletonShimmerPainter(
-            position: _animation.value,
-            color: widget.color,
-            opacity: widget.opacity,
+    // 对照实验用：关掉后不建 CustomPaint、不跑动画，只返回骨架本体。
+    if (!widget.enabled) return widget.child;
+
+    // 关键：**不要用 CustomPaint(foregroundPainter)**。
+    //
+    // foregroundPainter 要求 CustomPaint 先把 child 完整画出来，再在其上叠前景，
+    // 这会让整棵骨架子树每帧被迫走 saveLayer（整页大小），于是每一帧都要
+    // 重新光栅化整片骨架。实测（1600x1000，debug，--profile-frames）：
+    //   foregroundPainter 方案：raster = 64 / 90 / 171 / 151 / 208 / 216 / 126 ms
+    //   （关掉 shimmer 的对照组：raster 最高仅 31ms）
+    // 216ms/帧 = 4.6fps，正是"卡死"的观感来源。
+    //
+    // 改成「两层」结构：
+    //   1. 骨架本体包进 RepaintBoundary —— 只画一次进图层，动画期间完全不重绘；
+    //   2. 流光作为一个独立的透明图层叠在上面，每帧只重绘这一层的小色块。
+    return Stack(
+      children: [
+        // 骨架本体：稳定图层，不参与逐帧重绘
+        RepaintBoundary(child: widget.child),
+        // 流光覆盖层：只有它在动
+        Positioned.fill(
+          child: IgnorePointer(
+            child: AnimatedBuilder(
+              animation: _animation,
+              builder: (context, _) {
+                return CustomPaint(
+                  painter: _SkeletonShimmerPainter(
+                    position: _animation.value,
+                    color: widget.color,
+                    opacity: widget.opacity,
+                  ),
+                );
+              },
+            ),
           ),
-          child: child,
-        );
-      },
+        ),
+      ],
     );
   }
 }

@@ -14,6 +14,7 @@ import 'components/components.dart';
 import 'components/window_frame.dart';
 import 'foundation/app.dart';
 import 'foundation/appdata.dart';
+import 'foundation/frame_profiler.dart';
 import 'headless.dart';
 import 'init.dart';
 
@@ -26,6 +27,8 @@ void main(List<String> args) {
   overrideIO(() {
     runZonedGuarded(() async {
       WidgetsFlutterBinding.ensureInitialized();
+      // 诊断用逐帧探针，默认不启用（只在带 --profile-frames 时生效）。
+      FrameProfiler.install(args);
       await init();
       runApp(const MyApp());
       if (App.isDesktop) {

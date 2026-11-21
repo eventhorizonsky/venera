@@ -32,6 +32,7 @@ import 'package:venera/utils/init.dart';
 
 import 'comic_source/comic_source.dart';
 import 'consts.dart';
+import 'frame_profiler.dart';
 import 'log.dart';
 
 class JavaScriptRuntimeException implements Exception {
@@ -272,7 +273,31 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
   }
 
   dynamic runCode(String js, [String? name]) {
-    return _engine!.evaluate(js, name: name);
+    // JS 求值在 **UI isolate 上同步执行**（flutter_qjs 的 FlutterQjs.evaluate
+    // 直接调 jsEval，没有独立线程）。也就是说只要某段源脚本里的同步逻辑
+    // 跑得久，就会整段占住 UI 线程、直接吃掉这一帧。
+    //
+    // 这里只在 --profile-frames 模式下计时，用来确认"详情页首次加载的同步
+    // JS 耗时"是不是掉帧来源。未启用时只是一次 bool 判断。
+    if (!FrameProfiler.enabled) {
+      return _engine!.evaluate(js, name: name);
+    }
+    final sw = Stopwatch()..start();
+    try {
+      return _engine!.evaluate(js, name: name);
+    } finally {
+      sw.stop();
+      final ms = sw.elapsedMicroseconds / 1000.0;
+      if (ms >= 8) {
+        // 截断 js 片段，避免把整段脚本刷进日志
+        final snippet = js.replaceAll(RegExp(r'\s+'), ' ').trim();
+        Log.info(
+          'FrameProfile',
+          'js ${(name ?? '<eval>')} ${ms.toStringAsFixed(1)}ms :: '
+              '${snippet.length > 90 ? '${snippet.substring(0, 90)}...' : snippet}',
+        );
+      }
+    }
   }
 
   void dispose() {
