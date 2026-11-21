@@ -82,6 +82,25 @@ class NaviPaneState extends State<NaviPane>
 
   late AnimationController controller;
 
+  /// 本层 Navigator 用的 Hero 控制器，**必须在 State 生命周期内只建一次**。
+  ///
+  /// 之前它是在 buildMainView() 里 `MaterialApp.createMaterialHeroController()`
+  /// 现场 new 出来的，而 buildMainView() 每次 setState 都会重跑，于是：
+  ///
+  ///   1. HeroController 是 NavigatorObserver，每次新建的实例都不同，导致
+  ///      Navigator 每次 build 都要 `_updateHeroController` 换一次 observer ——
+  ///      正在飞行中的 Hero flight 会被反复摘挂；
+  ///   2. debug 下每次都触发 SDK 的断言
+  ///      "A HeroController can not be shared by multiple Navigators"
+  ///      （NavigatorState._updateHeroController 里对 navigator != null 的检查）；
+  ///   3. 旧实例从不 dispose，里面 _flights 的 OverlayEntry 泄漏。
+  ///
+  /// 改成懒加载字段：首次 build 时创建，之后所有 rebuild 复用同一个。
+  HeroController? _heroController;
+
+  HeroController get heroController =>
+      _heroController ??= MaterialApp.createMaterialHeroController();
+
   final _naviItemTapListeners = <NaviItemTapListener>[];
 
   void addNaviItemTapListener(NaviItemTapListener listener) {
@@ -145,6 +164,10 @@ class NaviPaneState extends State<NaviPane>
   @override
   void dispose() {
     controller.dispose();
+    // HeroController 是 NavigatorObserver，持有飞行中 Hero 的 OverlayEntry，
+    // 不显式 dispose 会泄漏（旧实现每帧 new 一个、从未释放）。
+    _heroController?.dispose();
+    _heroController = null;
     widget.observer.removeListener(onNavigatorStateChange);
     RootPopStamp.revision.removeListener(_onRootStackChanged);
     super.dispose();
@@ -233,7 +256,8 @@ class NaviPaneState extends State<NaviPane>
 
   Widget buildMainView() {
     return HeroControllerScope(
-      controller: MaterialApp.createMaterialHeroController(),
+      // 复用同一个控制器，不能在这里 new（见 heroController 字段的说明）。
+      controller: heroController,
       child: PopScope(
         // 根 Navigator 上还压着页面（阅读器等）时，本层绝不能声明
         // "我能拦返回"——那会让框架把同一次返回继续分发给内层。

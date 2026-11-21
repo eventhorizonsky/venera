@@ -227,10 +227,20 @@ class _MySliverAppBarDelegate extends SliverPersistentHeaderDelegate {
     ).paddingTop(topPadding);
 
     if (style == AppbarStyle.blur) {
+      // 只在内容确实压在 AppBar 底下时才开模糊。
+      //
+      // 旧实现无条件写死 blur: 15：即使 AppBar 静止、下面什么都还没滚上来，
+      // 也每帧做一次全宽 15σ 高斯（4K 下横向近 1900 逻辑像素），是转场掉帧
+      // 最贵的一项之一。普通 Appbar 早就按 _scrolledUnder 切换了，这里对齐它。
+      //
+      // shrinkOffset 是当前折叠量；overlapsContent 由框架在内容压上来时才为真。
+      final blurring = overlapsContent || shrinkOffset > 0;
       return SizedBox.expand(
         child: BlurEffect(
-          blur: 15,
+          blur: blurring ? 15 : 0,
           child: Material(
+            // 半透明度保持原值不变：未滚动时 AppBar 底下就是 Scaffold 背景，
+            // 0.86 半透明的 surface 盖在 surface 上视觉等价于不透明，无需跟着改。
             color: context.colorScheme.surface.toOpacity(0.86),
             elevation: 0,
             borderRadius: BorderRadius.circular(radius),

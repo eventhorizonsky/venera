@@ -94,10 +94,19 @@ mixin _AppRouteTransitionMixin<T> on PageRoute<T> {
       result = buildContent(context);
     }
 
+    // 每页根节点独立成层。
+    //
+    // 转场期（SlidePageTransitionBuilder / 预测式返回）每帧都在移动整页，
+    // 若页面内容与页面位置共用一个图层，**整棵树每帧全量重绘 + 重新光栅化**，
+    // 成本随窗口面积线性增长：4K 实测同一个封面从 1200² 的 12ms/帧
+    // 恶化到 60~190ms/帧，转场被拉长到 750ms 以上（标称 300ms）。
+    //
+    // 加一层 RepaintBoundary 后，页面内容只画一次进图层，滑动阶段退化为
+    // 纯变换（合成器直接搬运），不再逐帧重绘。
     return Semantics(
       scopesRoute: true,
       explicitChildNodes: true,
-      child: result,
+      child: RepaintBoundary(child: result),
     );
   }
 
@@ -515,13 +524,17 @@ class SlidePageTransitionBuilder extends PageTransitionsBuilder {
           begin: Offset.zero,
           end: const Offset(-0.4, 0),
         ).animate(secondaryCurve),
-        child: PhysicalModel(
-          color: Colors.transparent,
-          borderRadius: BorderRadius.zero,
-          clipBehavior: Clip.hardEdge,
-          elevation: 6,
-          child: Material(child: child),
-        ),
+        // 这里原来是 PhysicalModel(elevation: 6)，整页包一层带阴影的物理模型。
+        //
+        // 两个问题：
+        //   1. 阴影看不见——页面铺满整个窗口，elevation 打出来的阴影全部落在
+        //      窗口之外被裁掉，纯属无效绘制；
+        //   2. 代价很高——PhysicalModel 带 elevation + Clip.hardEdge 会强制
+        //      每帧 saveLayer（整窗大小）+ 重新生成阴影几何，而阴影的形状
+        //      根本不随页面平移而变。
+        //
+        // 换成不带 elevation 的 Material：视觉无差别，省掉每帧一次整窗 saveLayer。
+        child: Material(child: child),
       ),
     );
   }
